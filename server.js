@@ -8,18 +8,20 @@ const app = express();
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
     cors: {
-        origin: "http://localhost:5173", // Default Vite dev server port
+        origin: "http://localhost:5173",
         methods: ["GET", "POST"]
     }
 });
 
-// Animal state management
+// Enhanced animal state management
 const animalState = {
     isHungry: true,
     isThirsty: true,
     isDirty: true,
     hasWaste: true,
     isBusy: false,
+    currentActivity: null,
+    activityQueue: [],
     lastUpdate: {
         fed: null,
         drink: null,
@@ -28,106 +30,181 @@ const animalState = {
     }
 };
 
-// Store connected visitors on Set()(unique)
-const visitors = new Set();
-
-//animal busy state (1 second)
-const setBusyState = () => {
-    animalState.isBusy = true;
-    io.emit('animal_state_update', animalState);
-    
-    setTimeout(() => {
-        animalState.isBusy = false;
-        io.emit('animal_state_update', animalState);
-    }, 1000); 
+// Activity durations (in milliseconds)
+const ACTIVITY_TIMINGS = {
+    feed: 6500, 
+    drink: 6500,
+    wash: 6500, 
+    clean: 6500,
+    resetDelay: 7500
 };
 
-// Reset animal state after delay (5 seconds)
-const resetStateAfterDelay = (stateKey) => {
+// Store active users with persistence
+const activeUsers = new Map();
+
+// Process the next activity in queue
+const processNextActivity = () => {
+    if (animalState.activityQueue.length === 0 || animalState.isBusy) {
+        return;
+    }
+
+    const nextActivity = animalState.activityQueue.shift();
+    executeActivity(nextActivity);
+};
+
+// Execute a single activity
+const executeActivity = ({ action, socket, visitorName }) => {
+    animalState.isBusy = true;
+    animalState.currentActivity = action;
+    io.emit('animal_state_update', animalState);
+
+    // Update state based on action
+    switch(action) {
+        case 'feed':
+            animalState.isHungry = false;
+            animalState.lastUpdate.fed = new Date();
+            break;
+        case 'drink':
+            animalState.isThirsty = false;
+            animalState.lastUpdate.drink = new Date();
+            break;
+        case 'wash':
+            animalState.isDirty = false;
+            animalState.lastUpdate.wash = new Date();
+            break;
+        case 'clean':
+            animalState.hasWaste = false;
+            animalState.lastUpdate.clean = new Date();
+            break;
+    }
+
+    // Emit state update and interaction event
+    io.emit('animal_state_update', animalState);
+    io.emit('interaction_event', { user: visitorName, action });
+
+    // Schedule activity completion
     setTimeout(() => {
-        animalState[stateKey] = true;
-        animalState.lastUpdate[stateKey] = null;
+        animalState.isBusy = false;
+        animalState.currentActivity = null;
         io.emit('animal_state_update', animalState);
-    }, 5000);
+
+        // Process next activity if any
+        processNextActivity();
+    }, ACTIVITY_TIMINGS[action]);
+
+    // Schedule state reset
+    setTimeout(() => {
+        switch(action) {
+            case 'feed':
+                animalState.isHungry = true;
+                break;
+            case 'drink':
+                animalState.isThirsty = true;
+                break;
+            case 'wash':
+                animalState.isDirty = true;
+                break;
+            case 'clean':
+                animalState.hasWaste = true;
+                break;
+        }
+        animalState.lastUpdate[action] = null;
+        io.emit('animal_state_update', animalState);
+    }, ACTIVITY_TIMINGS.resetDelay);
 };
 
 // Socket.IO connection handling
 io.on('connection', (socket) => {
     console.log('A user connected:', socket.id);
 
-    // Send initial animal state
-    socket.emit('animal_state_update', animalState);
-
-    // Handle visitor joining
-    socket.on('join_room', (visitorName) => {
-        socket.visitorName = visitorName;
-        visitors.add(visitorName);
-        io.emit('visitor_joined', Array.from(visitors));
+    // Handle visitor joining with persistence
+    socket.on('join_room', (visitorData) => {
+        const { visitorName, sessionId } = visitorData;
+        
+        // Store visitor data with session
+        socket.data.visitorName = visitorName;
+        socket.data.sessionId = sessionId;
+        activeUsers.set(sessionId, { visitorName, socketId: socket.id });
+        
+        console.log('Join room:', { 
+            socketId: socket.id, 
+            visitorName,
+            sessionId 
+        });
+        
+        // Send current state to new user
+        socket.emit('animal_state_update', animalState);
+        
         io.emit('chat_message', {
             type: 'system',
             message: `${visitorName} has joined the zoo!`
         });
     });
 
+    // Handle animal interactions with queuing
+    socket.on('interact_animal', (action) => {
+        const visitorName = socket.data.visitorName;
+        
+        if (!visitorName) {
+            socket.emit('interaction_failed', 'User session not found');
+            return;
+        }
+
+        console.log('Interaction requested:', {
+            visitorName,
+            action,
+            socketId: socket.id
+        });
+
+        // Add activity to queue
+        animalState.activityQueue.push({
+            action,
+            socket,
+            visitorName
+        });
+
+        // Try to process next activity
+        processNextActivity();
+    });
+
     // Handle chat messages
     socket.on('send_message', (message) => {
+        const visitorName = socket.data.visitorName;
+        if (!visitorName) return;
+
         io.emit('chat_message', {
             type: 'user',
-            user: socket.visitorName,
+            user: visitorName,
             message: message
         });
     });
 
-    // Handle animal interactions
-    socket.on('interact_animal', (action) => {
-        // Check if animal is busy
-        if (animalState.isBusy) {
-            socket.emit('interaction_failed', 'The animal is busy!');
-            return;
+    // Handle reconnection
+    socket.on('reconnect_session', (sessionId) => {
+        const userData = activeUsers.get(sessionId);
+        if (userData) {
+            socket.data.visitorName = userData.visitorName;
+            socket.data.sessionId = sessionId;
+            activeUsers.set(sessionId, { ...userData, socketId: socket.id });
+            socket.emit('session_restored', userData);
         }
-    
-        // Set busy state immediately
-        setBusyState();
-    
-        switch(action) {
-            case 'feed':
-                animalState.isHungry = false;
-                animalState.lastUpdate.fed = new Date();
-                resetStateAfterDelay('isHungry');
-                break;
-            case 'drink':
-                animalState.isThirsty = false;
-                animalState.lastUpdate.drink = new Date();
-                resetStateAfterDelay('isThirsty');
-                break;
-            case 'wash':
-                animalState.isDirty = false;
-                animalState.lastUpdate.wash = new Date();
-                resetStateAfterDelay('isDirty');
-                break;
-            case 'clean':
-                animalState.hasWaste = false;
-                animalState.lastUpdate.clean = new Date();
-                resetStateAfterDelay('hasWaste');
-                break;
-        }
-    
-        io.emit('animal_state_update', animalState);
-        io.emit('interaction_event', {
-            user: socket.visitorName,
-            action: action
-        });
     });
 
     // Handle disconnection
     socket.on('disconnect', () => {
-        console.log('User disconnected:', socket.id);
-        if (socket.visitorName) {
-            visitors.delete(socket.visitorName);
-            io.emit('visitor_joined', Array.from(visitors));
+        const visitorName = socket.data.visitorName;
+        const sessionId = socket.data.sessionId;
+        
+        console.log('User disconnected:', { 
+            socketId: socket.id, 
+            visitorName,
+            sessionId
+        });
+        
+        if (visitorName) {
             io.emit('chat_message', {
                 type: 'system',
-                message: `${socket.visitorName} has left the zoo!`
+                message: `${visitorName} has left the zoo!`
             });
         }
     });
