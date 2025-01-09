@@ -4,218 +4,256 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 require('dotenv').config();
 
-const app = express();
-const httpServer = createServer(app);
-const io = new Server(httpServer, {
-    cors: {
-        // origin: "http://localhost:5173",
-        origin: "https://gp-onlinezoo.web.app",
-        methods: ["GET", "POST"]
-    }
-});
-
-// Enhanced animal state management
-const animalState = {
-    isHungry: true,
-    isThirsty: true,
-    isDirty: true,
-    hasWaste: true,
-    isBusy: false,
-    currentActivity: null,
-    activityQueue: [],
-    lastUpdate: {
-        fed: null,
-        drink: null,
-        wash: null,
-        clean: null
-    }
-};
-
-// Activity durations (in milliseconds)
+// Constants
 const ACTIVITY_TIMINGS = {
-    feed: 6500, 
+    feed: 6500,
     drink: 6500,
-    wash: 6500, 
+    wash: 6500,
     clean: 6500,
     resetDelay: 7500
 };
 
-// Store active users with persistence
-const activeUsers = new Map();
-
-// Process the next activity in queue
-const processNextActivity = () => {
-    if (animalState.activityQueue.length === 0 || animalState.isBusy) {
-        return;
+class AnimalManager {
+    constructor() {
+        this.state = {
+            isHungry: true,
+            isThirsty: true,
+            isDirty: true,
+            hasWaste: true,
+            isBusy: false,
+            currentActivity: null,
+            activityQueue: [],
+            lastUpdate: {
+                fed: null,
+                drink: null,
+                wash: null,
+                clean: null
+            }
+        };
     }
 
-    const nextActivity = animalState.activityQueue.shift();
-    executeActivity(nextActivity);
-};
-
-// Execute a single activity
-const executeActivity = ({ action, socket, visitorName }) => {
-    animalState.isBusy = true;
-    animalState.currentActivity = action;
-    io.emit('animal_state_update', animalState);
-
-    // Update state based on action
-    switch(action) {
-        case 'feed':
-            animalState.isHungry = false;
-            animalState.lastUpdate.fed = new Date();
-            break;
-        case 'drink':
-            animalState.isThirsty = false;
-            animalState.lastUpdate.drink = new Date();
-            break;
-        case 'wash':
-            animalState.isDirty = false;
-            animalState.lastUpdate.wash = new Date();
-            break;
-        case 'clean':
-            animalState.hasWaste = false;
-            animalState.lastUpdate.clean = new Date();
-            break;
+    queueActivity(activity) {
+        this.state.activityQueue.push(activity);
     }
 
-    // Emit state update and interaction event
-    io.emit('animal_state_update', animalState);
-    io.emit('interaction_event', { user: visitorName, action });
+    processNextActivity(io) {
+        if (this.state.activityQueue.length === 0 || this.state.isBusy) {
+            return;
+        }
 
-    // Schedule activity completion
-    setTimeout(() => {
-        animalState.isBusy = false;
-        animalState.currentActivity = null;
-        io.emit('animal_state_update', animalState);
+        const activity = this.state.activityQueue.shift();
+        this.executeActivity(activity, io);
+    }
 
-        // Process next activity if any
-        processNextActivity();
-    }, ACTIVITY_TIMINGS[action]);
+    executeActivity({ action, visitorName }, io) {
+        this.state.isBusy = true;
+        this.state.currentActivity = action;
 
-    // Schedule state reset
-    setTimeout(() => {
-        switch(action) {
+        // Update state based on action
+        switch (action) {
             case 'feed':
-                animalState.isHungry = true;
+                this.state.isHungry = false;
                 break;
             case 'drink':
-                animalState.isThirsty = true;
+                this.state.isThirsty = false;
                 break;
             case 'wash':
-                animalState.isDirty = true;
+                this.state.isDirty = false;
                 break;
             case 'clean':
-                animalState.hasWaste = true;
+                this.state.hasWaste = false;
                 break;
         }
-        animalState.lastUpdate[action] = null;
-        io.emit('animal_state_update', animalState);
-    }, ACTIVITY_TIMINGS.resetDelay);
-};
+
+        this.state.lastUpdate[action] = new Date();
+        io.emit('animal_state_update', this.state);
+        io.emit('interaction_event', { user: visitorName, action });
+
+        // Schedule activity completion
+        setTimeout(() => {
+            this.state.isBusy = false;
+            this.state.currentActivity = null;
+            io.emit('animal_state_update', this.state);
+            this.processNextActivity(io);
+        }, ACTIVITY_TIMINGS[action]);
+
+        // Schedule state reset
+        setTimeout(() => {
+            switch (action) {
+                case 'feed':
+                    this.state.isHungry = true;
+                    break;
+                case 'drink':
+                    this.state.isThirsty = true;
+                    break;
+                case 'wash':
+                    this.state.isDirty = true;
+                    break;
+                case 'clean':
+                    this.state.hasWaste = true;
+                    break;
+            }
+            this.state.lastUpdate[action] = null;
+            io.emit('animal_state_update', this.state);
+        }, ACTIVITY_TIMINGS.resetDelay);
+    }
+}
+
+class UserManager {
+    constructor() {
+        this.activeUsers = new Map();
+        this.connectedSessions = new Set();
+    }
+
+    addUser(sessionId, userData) {
+        this.activeUsers.set(sessionId, userData);
+        this.connectedSessions.add(sessionId);
+    }
+
+    removeUser(sessionId) {
+        this.activeUsers.delete(sessionId);
+        this.connectedSessions.delete(sessionId);
+    }
+
+    isSessionConnected(sessionId) {
+        return this.connectedSessions.has(sessionId);
+    }
+
+    getUser(sessionId) {
+        return this.activeUsers.get(sessionId);
+    }
+}
+
+// Initialize Express and Socket.IO
+const app = express();
+const httpServer = createServer(app);
+const io = new Server(httpServer, {
+    cors: {
+        origin: " https://gp-onlinezoo.web.app/",
+        methods: ["GET", "POST"]
+    },
+    pingTimeout: 60000,
+    pingInterval: 25000,
+    connectTimeout: 45000,
+    reconnection: true,
+    reconnectionAttempts: 5,
+    reconnectionDelay: 1000
+});
+
+// Initialize managers
+const animalManager = new AnimalManager();
+const userManager = new UserManager();
 
 // Socket.IO connection handling
 io.on('connection', (socket) => {
-    console.log('A user connected:', socket.id);
+    console.log('New connection:', socket.id);
 
-    // Handle visitor joining with persistence
+    // Handle visitor joining
     socket.on('join_room', (visitorData) => {
         const { visitorName, sessionId } = visitorData;
-        
-        // Store visitor data with session
-        socket.data.visitorName = visitorName;
+
+        if (!sessionId || !visitorName) {
+            socket.emit('error', 'Invalid session data');
+            return;
+        }
+
+        // Prevent duplicate connections
+        if (userManager.isSessionConnected(sessionId)) {
+            socket.emit('error', 'Session already connected');
+            return;
+        }
+
+        // Store user data
         socket.data.sessionId = sessionId;
-        activeUsers.set(sessionId, { visitorName, socketId: socket.id });
-        
-        console.log('Join room:', { 
-            socketId: socket.id, 
-            visitorName,
-            sessionId 
-        });
-        
-        // Send current state to new user
-        socket.emit('animal_state_update', animalState);
-        
+        socket.data.visitorName = visitorName;
+        userManager.addUser(sessionId, { visitorName, socketId: socket.id });
+
+        // Send initial state and welcome message
+        socket.emit('animal_state_update', animalManager.state);
         io.emit('chat_message', {
             type: 'system',
             message: `${visitorName} has joined the zoo!`
         });
+
+        console.log('User joined:', { sessionId, visitorName, socketId: socket.id });
     });
 
-    // Handle animal interactions with queuing
+    // Handle animal interactions
     socket.on('interact_animal', (action) => {
-        const visitorName = socket.data.visitorName;
-        
-        if (!visitorName) {
-            socket.emit('interaction_failed', 'User session not found');
+        const { sessionId, visitorName } = socket.data;
+
+        if (!sessionId || !visitorName) {
+            socket.emit('error', 'Not authenticated');
             return;
         }
 
-        console.log('Interaction requested:', {
-            visitorName,
-            action,
-            socketId: socket.id
-        });
+        console.log('Interaction:', { action, visitorName, socketId: socket.id });
 
-        // Add activity to queue
-        animalState.activityQueue.push({
-            action,
-            socket,
-            visitorName
-        });
-
-        // Try to process next activity
-        processNextActivity();
+        animalManager.queueActivity({ action, visitorName });
+        animalManager.processNextActivity(io);
     });
 
     // Handle chat messages
     socket.on('send_message', (message) => {
-        const visitorName = socket.data.visitorName;
-        if (!visitorName) return;
+        const { visitorName } = socket.data;
+        
+        if (!visitorName || !message.trim()) {
+            return;
+        }
 
         io.emit('chat_message', {
             type: 'user',
             user: visitorName,
-            message: message
+            message: message.trim()
         });
     });
 
-    // Handle reconnection
+    // Handle session reconnection
     socket.on('reconnect_session', (sessionId) => {
-        const userData = activeUsers.get(sessionId);
+        const userData = userManager.getUser(sessionId);
         if (userData) {
-            socket.data.visitorName = userData.visitorName;
             socket.data.sessionId = sessionId;
-            activeUsers.set(sessionId, { ...userData, socketId: socket.id });
+            socket.data.visitorName = userData.visitorName;
+            userManager.addUser(sessionId, { ...userData, socketId: socket.id });
             socket.emit('session_restored', userData);
+            console.log('Session restored:', { sessionId, userData });
         }
+    });
+
+    // Handle heartbeat
+    socket.on('heartbeat', () => {
+        socket.emit('heartbeat_response');
     });
 
     // Handle disconnection
     socket.on('disconnect', () => {
-        const visitorName = socket.data.visitorName;
-        const sessionId = socket.data.sessionId;
-        
-        console.log('User disconnected:', { 
-            socketId: socket.id, 
-            visitorName,
-            sessionId
-        });
-        
-        if (visitorName) {
-            io.emit('chat_message', {
-                type: 'system',
-                message: `${visitorName} has left the zoo!`
-            });
+        const { sessionId, visitorName } = socket.data;
+
+        if (sessionId) {
+            userManager.removeUser(sessionId);
+
+            if (visitorName) {
+                io.emit('chat_message', {
+                    type: 'system',
+                    message: `${visitorName} has left the zoo!`
+                });
+            }
+
+            console.log('User disconnected:', { sessionId, visitorName, socketId: socket.id });
         }
     });
 });
 
-// Basic health check route
+// Health check endpoint
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok' });
+    res.json({ 
+        status: 'ok',
+        activeUsers: userManager.activeUsers.size,
+        queueLength: animalManager.state.activityQueue.length
+    });
 });
 
+// Start server
 const PORT = process.env.PORT || 3000;
 httpServer.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
