@@ -9,7 +9,7 @@ const httpServer = createServer(app);
 const io = new Server(httpServer, {
     cors: {
         // origin: "http://localhost:5173",
-        origin: "http://https://gp-onlinezoo.web.app",
+        origin: "https://gp-onlinezoo.web.app",
         methods: ["GET", "POST"]
     }
 });
